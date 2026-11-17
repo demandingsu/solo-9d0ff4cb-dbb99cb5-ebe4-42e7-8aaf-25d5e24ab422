@@ -1,0 +1,7 @@
+fastapi==0.163.1
+uvicorn[standard]==0.54.0
+pydantic==2.14.3
+
+# 自测依赖（生产运行不需要）
+pytest==9.2.0
+httpx==0.28.1

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# SQLite 本地数据
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 编辑器
+.vscode/
+.idea/

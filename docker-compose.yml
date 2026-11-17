@@ -1,0 +1,22 @@
+services:
+  image-lineage-api:
+    build: .
+    image: image-lineage-api:1.0.0
+    container_name: image-lineage-api
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库文件位置（容器内路径，挂载到命名卷持久化）
+      IMAGE_LINEAGE_DB: /data/lineage.db
+    volumes:
+      - lineage-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4); sys.exit(0 if json.load(r)['status']=='ok' else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 8s
+    restart: unless-stopped
+
+volumes:
+  lineage-data:
