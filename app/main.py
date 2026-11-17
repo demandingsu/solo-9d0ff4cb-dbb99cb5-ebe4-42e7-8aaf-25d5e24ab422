@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -27,13 +28,26 @@ from .schemas import (
 
 DEFAULT_DB_PATH = os.environ.get("IMAGE_LINEAGE_DB", "data/lineage.db")
 
+# 保护同 app 多 TestClient 并发进入/退出 lifespan 时的引用计数
+_lifespan_lock = threading.Lock()
+
 
 def get_db_path(request: Request) -> str:
     return request.app.state.db_path
 
 
-def get_conn(request: Request) -> sqlite3.Connection:
-    """每请求一个独立连接，响应结束即关闭。"""
+def get_conn(request: Request):
+    """请求级数据库访问。
+
+    - 文件库：每请求一个独立连接，响应结束即关闭（WAL 支持读写并发）。
+    - 内存库：复用服务级长连接，不在请求全程持锁；串行化由各事务
+      （snapshot 读事务 / BEGIN IMMEDIATE 写事务）在自身区间内持锁完成，
+      既保证整批原子与快照一致，又避免跨线程池工作线程持锁死锁。
+    """
+    memory = request.app.state.memory_db
+    if memory is not None:
+        yield memory.conn
+        return
     conn = db.connect(request.app.state.db_path)
     try:
         yield conn
@@ -46,17 +60,42 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.db_path = resolved_path
-        # 确保文件目录存在并初始化表结构
-        if resolved_path != ":memory:" and "?mode=memory" not in resolved_path:
-            parent = os.path.dirname(os.path.abspath(resolved_path))
-            os.makedirs(parent, exist_ok=True)
-        init_conn = db.connect(resolved_path)
+        # 同一 app 可能被多个 TestClient 并发包裹（测试场景）：
+        # 用引用计数保证内存库只初始化一次、最后一个上下文退出时才关闭。
+        with _lifespan_lock:
+            first_start = not getattr(app.state, "lifespan_depth", 0)
+            app.state.lifespan_depth = getattr(app.state, "lifespan_depth", 0) + 1
+
+        if first_start:
+            app.state.db_path = resolved_path
+            app.state.memory_db = None
+            if db.is_memory_db(resolved_path):
+                # 临时内存库：服务存活期间由单个长连接承载，所有请求共享；
+                # 服务停止（重启）即关闭连接，临时数据随之清空。
+                memory = db.MemoryDatabase()
+                app.state.memory_db = memory
+                db.init_db(memory.conn)
+            else:
+                # 文件库：确保目录存在，初始化表结构后关闭初始化连接
+                parent = os.path.dirname(os.path.abspath(resolved_path))
+                os.makedirs(parent, exist_ok=True)
+                init_conn = db.connect(resolved_path)
+                try:
+                    db.init_db(init_conn)
+                finally:
+                    init_conn.close()
         try:
-            db.init_db(init_conn)
+            yield
         finally:
-            init_conn.close()
-        yield
+            with _lifespan_lock:
+                app.state.lifespan_depth -= 1
+                last_exit = app.state.lifespan_depth == 0
+            if last_exit and app.state.memory_db is not None:
+                app.state.memory_db.close()
+                app.state.memory_db = None
+            if last_exit:
+                # 完整关闭后允许同一 app 工厂重新启动一轮（如模拟服务重启）
+                app.state.lifespan_depth = 0
 
     app = FastAPI(
         title="影像谱系 API",

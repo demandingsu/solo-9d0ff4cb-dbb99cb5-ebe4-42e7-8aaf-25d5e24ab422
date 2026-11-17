@@ -17,22 +17,25 @@
   - `cycle` 循环引用（引用链成环，含自引用）
 - **整批拒收**：同号同修订但清单内容（摘要/父引用）不同时，整批拒绝、零写入，
   原有结论保持不变，并返回冲突明细；完全相同的重复提交按幂等处理。
-- **并发安全**：写事务 `BEGIN IMMEDIATE` 串行化；每次查询在单个 SQLite 快照事务内
-  完成全部读取，不会混用某次并发提交前后的谱系状态。
+- **并发安全**：文件库写事务 `BEGIN IMMEDIATE` 串行化；每次查询在单个 SQLite 快照事务内
+  完成全部读取，不会混用某次并发提交前后的谱系状态。内存库则以单长连接 +
+  事务级可重入锁串行所有访问，语义保持一致（整批原子、查询快照自洽）。
 - **审计**：所有批次（含拒收/重复）写入 `batches` 表，可通过 `/api/batches` 追溯。
 
 ## 目录结构
 
 ```
 app/
-  main.py       FastAPI 路由与应用工厂
+  main.py       FastAPI 路由与应用工厂（含内存/文件库连接生命周期）
   schemas.py    Pydantic 请求/响应模型（中文 Schema 说明）
-  database.py   SQLite 连接、显式事务、整批原子提交
+  database.py   SQLite 连接、显式事务、整批原子提交、内存库长连接与事务锁
   lineage.py    谱系评估（缺失/退役/环检测与引用路径）
 tests/
-  test_api.py   18 个端到端关键情形自测
+  test_api.py        18 个端到端关键情形自测（文件库）
+  test_memory_db.py  内存库生命周期与并发交错自测（7 个情形）
 Dockerfile
-docker-compose.yml
+docker-compose.yml          文件持久化（正式交付）
+docker-compose.memory.yml   临时内存库（试传/核对，重启清空）
 requirements.txt
 ```
 
@@ -50,6 +53,25 @@ SQLite 文件位于容器内 `/data/lineage.db`，通过命名卷 `lineage-data`
 
 停止并保留数据：`docker compose down`；连同数据卷一起清除：
 `docker compose down -v`。
+
+### 临时内存库模式（试传 / 核对引用状态）
+
+交接员在正式交付前可用内存库试传瓦片与拼图清单，数据不落盘：
+
+```bash
+docker compose -f docker-compose.memory.yml up --build
+# 同样在 http://localhost:8000 提供服务与 /docs
+```
+
+- 由 `IMAGE_LINEAGE_DB=:memory:` 启用，整个服务只维护一个进程内长连接，
+  批次提交、修订历史与谱系查询共享同一份已提交数据（不再出现
+  初始化连接关闭后 `no such table: revisions` 的问题）。
+- 事务级串行化：写事务整体持锁保证整批原子，读快照事务整体持锁保证
+  一次查询只见同一已提交谱系，提交与查询交错也不会读到半批或撕裂状态。
+- **重启即清空**：容器/进程重启后临时数据全部消失；同时运行的两个服务
+  （或内存模式与文件模式并存）各自内存独立，互不串库。
+- 内存模式不挂载任何卷；核对无误后，改用默认 `docker-compose.yml`
+  （文件持久化）向正式库交付。文件库的 WAL、每请求独立连接等原有行为不变。
 
 ## 本地直接运行
 

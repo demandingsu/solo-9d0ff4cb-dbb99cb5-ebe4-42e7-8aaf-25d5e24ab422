@@ -1,0 +1,26 @@
+# 临时内存库（试传/核对）模式：
+#   docker compose -f docker-compose.memory.yml up --build
+#
+# 与默认 docker-compose.yml 的区别：
+# - IMAGE_LINEAGE_DB=:memory:，数据只存在于容器进程内存，不挂载任何数据卷；
+# - 同一服务内的批次提交、修订历史与谱系查询共享同一份已提交数据；
+# - 容器重启（docker compose restart / 停机再启动）后临时数据清空；
+# - 同时运行多个容器（或与文件库模式并存）时各自内存独立，互不串库。
+# 核对无误后再用默认的 docker-compose.yml（文件持久化）向正式库交付。
+services:
+  image-lineage-api-memory:
+    build: .
+    image: image-lineage-api:1.0.0
+    container_name: image-lineage-api-memory
+    ports:
+      - "8000:8000"
+    environment:
+      IMAGE_LINEAGE_DB: ":memory:"
+    # 内存模式刻意不挂载卷：容器删除/重启后数据不保留
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4); sys.exit(0 if json.load(r)['status']=='ok' else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 8s
+    restart: unless-stopped

@@ -1,16 +1,20 @@
 """SQLite 持久化层。
 
 并发与一致性策略：
-- WAL 模式，允许读写并发；写事务以 BEGIN IMMEDIATE 立即获取保留锁，
+- 文件库：WAL 模式，允许读写并发；写事务以 BEGIN IMMEDIATE 立即获取保留锁，
   多个写请求在锁上排队（busy_timeout 等待），写操作天然串行化。
+- 内存库（IMAGE_LINEAGE_DB=:memory: 或 file:...?mode=memory 共享缓存 URI）：
+  内存库随连接关闭即销毁，无法像文件库那样每请求新建连接；且共享缓存内存库
+  使用表级锁、busy_timeout 不生效，并发读写会立即报 "database table is locked"。
+  因此同一服务（进程）内复用单个长连接，以可重入锁串行化所有访问：
+  写事务整体持锁保证整批原子，读快照事务整体持锁保证一次查询只见同一已提交状态。
 - isolation_level=None（autocommit），所有事务边界显式管理。
-- 每个请求独立连接；读接口在单个 BEGIN..COMMIT 快照事务内完成全部查询，
+- 文件库每个请求独立连接；读接口在单个 BEGIN..COMMIT 快照事务内完成全部查询，
   因此一次查询不会混用并发提交前后的谱系状态。
 """
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -21,6 +25,50 @@ from typing import Any, Iterator, Optional
 # 否则 journal_mode=WAL 会抛 "database is locked"。
 _init_lock = threading.Lock()
 _wal_initialized: set[str] = set()
+
+# 内存长连接 id → 事务串行锁（sqlite3.Connection 不支持动态属性/弱引用）
+_memory_locks: dict[int, threading.RLock] = {}
+
+
+def is_memory_db(db_path: str) -> bool:
+    """是否为进程内临时内存库（重启即清空，不产生任何文件）。"""
+    return db_path == ":memory:" or "?mode=memory" in db_path
+
+
+class MemoryDatabase:
+    """进程内临时内存库的连接生命周期管理。
+
+    内存库的数据只活在持有它的连接里，而共享缓存内存库的表级锁又不支持
+    busy_timeout 排队，因此这里维护一个长连接 + 一把可重入锁，供同一服务
+    内的所有批次提交、修订历史与谱系查询共享已提交数据：
+
+    - 不同服务（进程）的内存库天然互不可见，互不串库；
+    - 服务重启（进程退出）后内存随之释放，临时数据清空；
+    - 锁仅在事务区间（snapshot / 写事务）内由工作线程获取与释放：
+      写事务整体持锁保证整批原子，读快照事务整体持锁保证一次查询只见
+      同一已提交状态；锁不跨线程池工作线程持有，避免属主线程死锁。
+
+    sqlite3.Connection 不支持动态属性与弱引用，故连接→锁的映射登记在
+    模块级注册表，连接关闭时显式注销。
+    """
+
+    def __init__(self) -> None:
+        # 私有匿名内存库：任何其他连接都无法打开它，库的生命与本连接一致
+        self.conn = sqlite3.connect(
+            ":memory:",
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.lock = threading.RLock()
+        _memory_locks[id(self.conn)] = self.lock
+
+    def close(self) -> None:
+        with self.lock:
+            _memory_locks.pop(id(self.conn), None)
+            self.conn.close()
+
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys=ON;
@@ -71,7 +119,7 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 def _ensure_wal(conn: sqlite3.Connection, db_path: str) -> None:
     """线程安全地把文件库切换到 WAL（每个进程每个库只切一次）。"""
-    if db_path == ":memory:" or "?mode=memory" in db_path:
+    if is_memory_db(db_path):
         return  # 内存库无需 WAL
     with _init_lock:
         if db_path in _wal_initialized:
@@ -86,13 +134,29 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
+def _txn_guard(conn: sqlite3.Connection) -> Iterator[None]:
+    """内存连接在事务区间持可重入锁串行化；文件连接无需额外锁（WAL 负责并发）。"""
+    lock = _memory_locks.get(id(conn))
+    if lock is None:
+        yield
+    else:
+        with lock:
+            yield
+
+
+@contextmanager
 def snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """只读快照事务：事务内的所有 SELECT 看到同一个已提交快照。"""
-    conn.execute("BEGIN")
-    try:
-        yield conn
-    finally:
-        conn.execute("COMMIT")
+    """只读快照事务：事务内的所有 SELECT 看到同一个已提交快照。
+
+    内存库下整个事务区间持锁，并发提交只能在快照结束后进入，
+    因此一次查询绝不会混用两次提交前后的谱系状态。
+    """
+    with _txn_guard(conn):
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        finally:
+            conn.execute("COMMIT")
 
 
 # ---------------------------------------------------------------------------
@@ -206,102 +270,104 @@ def submit_batch(conn: sqlite3.Connection, items: list[dict[str, Any]]) -> dict[
             deduped[key] = item
 
     # 2) 与库内已提交数据核对（在写事务内，锁定后复查，防止并发写交叉）
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        conflicts: list[dict[str, Any]] = []
-        identical_existing: set[tuple[str, int]] = set()
-        for key, item in deduped.items():
-            row = get_revision(conn, key[0], key[1])
-            if row is None:
-                continue
-            existing = _row_to_item(row)
-            if _content_differs(existing, item):
-                conflicts.append({
-                    "product_id": key[0],
-                    "revision": key[1],
-                    "submitted": item,
-                    "existing": existing,
-                })
-            else:
-                identical_existing.add(key)
+    with _txn_guard(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conflicts: list[dict[str, Any]] = []
+            identical_existing: set[tuple[str, int]] = set()
+            for key, item in deduped.items():
+                row = get_revision(conn, key[0], key[1])
+                if row is None:
+                    continue
+                existing = _row_to_item(row)
+                if _content_differs(existing, item):
+                    conflicts.append({
+                        "product_id": key[0],
+                        "revision": key[1],
+                        "submitted": item,
+                        "existing": existing,
+                    })
+                else:
+                    identical_existing.add(key)
 
-        if conflicts:
-            # 同号同修订但清单不同 → 整批拒收，revisions 零写入
+            if conflicts:
+                # 同号同修订但清单不同 → 整批拒收，revisions 零写入
+                batch_id = _insert_batch_record(
+                    conn, "rejected", item_count, 0,
+                    "同号同修订但清单不同，整批拒收",
+                )
+                conn.execute("COMMIT")
+                return {
+                    "batch_id": batch_id,
+                    "status": "rejected",
+                    "item_count": item_count,
+                    "inserted_count": 0,
+                    "conflicts": conflicts,
+                    "message": "整批拒收：存在同号同修订但清单不同的条目，原有结论保持不变",
+                }
+
+            now = utc_now_iso()
+            if len(identical_existing) == len(deduped):
+                # 整批为完全重复提交：幂等处理，不重复写 revisions
+                batch_id = _insert_batch_record(
+                    conn, "duplicate", item_count, 0,
+                    "与已提交清单完全一致，幂等接收且未重复写入",
+                )
+                conn.execute("COMMIT")
+                return {
+                    "batch_id": batch_id,
+                    "status": "duplicate",
+                    "item_count": item_count,
+                    "inserted_count": 0,
+                    "conflicts": [],
+                    "message": "清单与已提交内容完全一致，按重复提交处理（幂等）",
+                }
+
+            # 3) 写入新条目 + accepted 批次记录，同一事务原子提交
             batch_id = _insert_batch_record(
-                conn, "rejected", item_count, 0,
-                "同号同修订但清单不同，整批拒收",
+                conn, "accepted", item_count,
+                len(deduped) - len(identical_existing), None,
             )
+            for key, item in deduped.items():
+                if key in identical_existing:
+                    continue
+                conn.execute(
+                    "INSERT INTO revisions (product_id, revision, summary, "
+                    "parent_product_id, parent_revision, batch_id, submitted_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        item["product_id"], item["revision"], item["summary"],
+                        item["parent_product_id"], item["parent_revision"],
+                        batch_id, now,
+                    ),
+                )
             conn.execute("COMMIT")
             return {
                 "batch_id": batch_id,
-                "status": "rejected",
+                "status": "accepted",
                 "item_count": item_count,
-                "inserted_count": 0,
-                "conflicts": conflicts,
-                "message": "整批拒收：存在同号同修订但清单不同的条目，原有结论保持不变",
-            }
-
-        now = utc_now_iso()
-        if len(identical_existing) == len(deduped):
-            # 整批为完全重复提交：幂等处理，不重复写 revisions
-            batch_id = _insert_batch_record(
-                conn, "duplicate", item_count, 0,
-                "与已提交清单完全一致，幂等接收且未重复写入",
-            )
-            conn.execute("COMMIT")
-            return {
-                "batch_id": batch_id,
-                "status": "duplicate",
-                "item_count": item_count,
-                "inserted_count": 0,
+                "inserted_count": len(deduped) - len(identical_existing),
                 "conflicts": [],
-                "message": "清单与已提交内容完全一致，按重复提交处理（幂等）",
+                "message": "批次已提交",
             }
-
-        # 3) 写入新条目 + accepted 批次记录，同一事务原子提交
-        batch_id = _insert_batch_record(
-            conn, "accepted", item_count,
-            len(deduped) - len(identical_existing), None,
-        )
-        for key, item in deduped.items():
-            if key in identical_existing:
-                continue
-            conn.execute(
-                "INSERT INTO revisions (product_id, revision, summary, "
-                "parent_product_id, parent_revision, batch_id, submitted_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    item["product_id"], item["revision"], item["summary"],
-                    item["parent_product_id"], item["parent_revision"],
-                    batch_id, now,
-                ),
-            )
-        conn.execute("COMMIT")
-        return {
-            "batch_id": batch_id,
-            "status": "accepted",
-            "item_count": item_count,
-            "inserted_count": len(deduped) - len(identical_existing),
-            "conflicts": [],
-            "message": "批次已提交",
-        }
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def _record_rejected(
     conn: sqlite3.Connection, item_count: int, note: str
 ) -> int:
     """在独立短事务中记录拒收批次（不触碰 revisions，原结论不变）。"""
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        batch_id = _insert_batch_record(conn, "rejected", item_count, 0, note)
-        conn.execute("COMMIT")
-        return batch_id
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+    with _txn_guard(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            batch_id = _insert_batch_record(conn, "rejected", item_count, 0, note)
+            conn.execute("COMMIT")
+            return batch_id
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def _content_differs(a: dict[str, Any], b: dict[str, Any]) -> bool:
